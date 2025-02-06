@@ -43,7 +43,7 @@ const std::vector<const char *> validationLayers = {
     "VK_LAYER_KHRONOS_validation"};
 
 const std::vector<const char *> deviceExtensions = {
-    vk::KHRSwapchainExtensionName};
+    vk::KHRSwapchainExtensionName, vk::KHRSynchronization2ExtensionName};
 
 #ifdef NDEBUG
 const bool enableValidationLayers = false;
@@ -411,9 +411,6 @@ private:
                 depthImageMemory);
     depthImageView = createImageView(depthImage, depthFormat,
                                      vk::ImageAspectFlagBits::eDepth, 1);
-
-    transitionImageLayout(depthImage, depthFormat, vk::ImageLayout::eUndefined,
-                          vk::ImageLayout::eDepthStencilAttachmentOptimal, 1);
   }
 
   vk::Format findSupportedFormat(const std::vector<vk::Format> &candidates,
@@ -702,8 +699,8 @@ private:
 
     vk::ImageMemoryBarrier barrier{
         .sType = vk::StructureType::eImageMemoryBarrier,
-        .srcAccessMask = vk::AccessFlags(0),
-        .dstAccessMask = vk::AccessFlags(0),
+        .srcAccessMask = vk::AccessFlagBits::eNone,
+        .dstAccessMask = vk::AccessFlagBits::eNone,
         .oldLayout = oldLayout,
         .newLayout = newLayout,
         .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
@@ -720,7 +717,7 @@ private:
 
     if (oldLayout == vk::ImageLayout::eUndefined &&
         newLayout == vk::ImageLayout::eTransferDstOptimal) {
-      barrier.srcAccessMask = vk::AccessFlags(0);
+      barrier.srcAccessMask = vk::AccessFlagBits::eNone;
       barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
 
       sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
@@ -732,21 +729,13 @@ private:
 
       sourceStage = vk::PipelineStageFlagBits::eTransfer;
       destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
-    } else if (oldLayout == vk::ImageLayout::eUndefined &&
-               newLayout == vk::ImageLayout::eDepthStencilAttachmentOptimal) {
-      barrier.srcAccessMask = vk::AccessFlags(0);
-      barrier.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead |
-                              vk::AccessFlagBits::eDepthStencilAttachmentWrite;
-
-      sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
-      destinationStage = vk::PipelineStageFlagBits::eEarlyFragmentTests;
     } else {
-      throw std::runtime_error("unsupported layout transition!");
+      throw std::invalid_argument("unsupported layout transition!");
     }
 
-    commandBuffer.pipelineBarrier(
-        vk::PipelineStageFlags(0), vk::PipelineStageFlags(0),
-        vk::DependencyFlags(0), 0, nullptr, 0, nullptr, 1, &barrier);
+    commandBuffer.pipelineBarrier(sourceStage, destinationStage,
+                                  vk::DependencyFlags(0), 0, nullptr, 0,
+                                  nullptr, 1, &barrier);
 
     endSingleTimeCommands(commandBuffer);
   }
@@ -1247,7 +1236,7 @@ private:
                         vk::PipelineStageFlagBits::eEarlyFragmentTests,
         .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput |
                         vk::PipelineStageFlagBits::eEarlyFragmentTests,
-        .srcAccessMask = vk::AccessFlags(0),
+        .srcAccessMask = vk::AccessFlagBits::eNone,
         .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
                          vk::AccessFlagBits::eDepthStencilAttachmentWrite};
 
@@ -1536,14 +1525,19 @@ private:
         .sampleRateShading = vk::True, // enable sample shading
         .samplerAnisotropy = vk::True};
 
+    vk::PhysicalDeviceSynchronization2Features syncFeature{.synchronization2 =
+                                                               true};
+
     vk::DeviceCreateInfo createInfo{
         .sType = vk::StructureType::eDeviceCreateInfo,
+        .pNext = &syncFeature,
         .queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size()),
         .pQueueCreateInfos = queueCreateInfos.data(),
         .ppEnabledLayerNames = deviceExtensions.data(),
         .enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size()),
         .ppEnabledExtensionNames = deviceExtensions.data(),
-        .pEnabledFeatures = &deviceFeatures};
+        .pEnabledFeatures = &deviceFeatures,
+    };
 
     if (enableValidationLayers) {
       createInfo.enabledLayerCount =
