@@ -110,6 +110,48 @@ struct Vertex {
   }
 };
 
+struct Camera {
+  float fov = 45.0f;
+  float rotationX = 0.0f;
+  float rotationY = 0.0f;
+  bool autoRotate = false;
+  const float speed = 3.0f;
+  const float maxAngle = 359.0f;
+
+  void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
+    if (yoffset > 0) {
+      if (fov == 0.0f)
+        return;
+      fov -= 1.0f;
+    } else {
+      // TODO: add max FoV
+      fov += 1.0f;
+    }
+  }
+
+  void key_callback(GLFWwindow *window, int key, int scancode, int action,
+                    int mods) {
+    if (action != GLFW_REPEAT && action != GLFW_PRESS)
+      return;
+
+    switch (scancode) {
+    case 32:
+      if (rotationX < speed) {
+        float offset = rotationX - speed;
+        rotationX = maxAngle + offset;
+      } else {
+        rotationX -= speed;
+      }
+      break;
+    case 30:
+      rotationX = std::fmod(rotationX + speed, maxAngle);
+      break;
+    default:
+      return;
+    }
+  }
+};
+
 namespace std {
 template <> struct hash<Vertex> {
   size_t operator()(Vertex const &vertex) const {
@@ -202,6 +244,8 @@ private:
   vk::Image colorImage;
   vk::DeviceMemory colorImageMemory;
   vk::ImageView colorImageView;
+
+  Camera camera;
 
   std::vector<const char *> getRequiredExtensions() {
     uint32_t glfwExtensionCount = 0;
@@ -1776,6 +1820,16 @@ private:
   void mainLoop() {
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
+      glfwSetScrollCallback(
+          window, [](GLFWwindow *window, double xoffset, double yoffset) {
+            TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
+            app->camera.scroll_callback(window, xoffset, yoffset);
+          });
+      glfwSetKeyCallback(window, [](GLFWwindow *window, int key, int scancode,
+                                    int action, int mods) {
+        TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
+        app->camera.key_callback(window, key, scancode, action, mods);
+      });
       drawFrame();
     }
 
@@ -1850,23 +1904,29 @@ private:
   }
 
   void updateUniformBuffer(uint32_t currentImage) {
-    static auto startTime = std::chrono::high_resolution_clock::now();
-
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float time = std::chrono::duration<float, std::chrono::seconds::period>(
-                     currentTime - startTime)
-                     .count();
-
     UniformBufferObject ubo{
-        .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(0.0f),
-                             glm::vec3(0.0f, 0.0f, 1.0f)),
         .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f),
                             glm::vec3(0.0f, 0.0f, 0.0f),
                             glm::vec3(0.0f, 0.0f, 1.0f)),
-        .proj = glm::perspective(glm::radians(45.0f),
+        .proj = glm::perspective(glm::radians(camera.fov),
                                  swapChainExtent.width /
                                      (float)swapChainExtent.height,
                                  0.1f, 10.0f)};
+
+    if (camera.autoRotate) {
+      static auto startTime = std::chrono::high_resolution_clock::now();
+
+      auto currentTime = std::chrono::high_resolution_clock::now();
+      float time = std::chrono::duration<float, std::chrono::seconds::period>(
+                       currentTime - startTime)
+                       .count();
+
+      ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
+                              glm::vec3(0.0f, 0.0f, 1.0f));
+    } else {
+      ubo.model = glm::rotate(glm::mat4(1.0f), glm::radians(camera.rotationX),
+                              glm::vec3(0.0f, 0.0f, 1.0f));
+    }
 
     ubo.proj[1][1] *= -1;
 
