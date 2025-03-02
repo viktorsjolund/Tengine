@@ -14,6 +14,10 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
 
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_vulkan.h"
+
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -31,6 +35,14 @@
 #define STBI_NO_SIMD
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+static void check_vk_result(VkResult err) {
+  if (err == 0)
+    return;
+  fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
+  if (err < 0)
+    abort();
+}
 
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -209,6 +221,7 @@ public:
   void run() {
     initWindow();
     initVulkan();
+    initImGui();
     mainLoop();
     cleanup();
   }
@@ -235,6 +248,8 @@ private:
 
   vk::RenderPass renderPass;
   vk::DescriptorSetLayout descriptorSetLayout;
+
+  vk::PipelineCache pipelineCache;
 
   vk::PipelineLayout particlesPipelineLayout;
   vk::Pipeline particlesPipeline;
@@ -265,6 +280,8 @@ private:
   std::vector<vk::Buffer> uniformBuffers;
   std::vector<vk::DeviceMemory> uniformBuffersMemory;
   std::vector<void *> uniformBuffersMapped;
+
+  vk::DescriptorPool imGuiDescriptorPool;
 
   vk::DescriptorPool descriptorPool;
   std::vector<vk::DescriptorSet> descriptorSets;
@@ -392,6 +409,36 @@ private:
         .pfnUserCallback = debugCallback};
   }
 
+  void initImGui() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ImGui_ImplGlfw_InitForVulkan(window, true);
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = instance;
+    init_info.PhysicalDevice = physicalDevice;
+    init_info.Device = device;
+
+    QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+    init_info.QueueFamily = indices.graphicsAndComputeFamily.value();
+
+    init_info.Queue = graphicsQueue;
+    init_info.PipelineCache = pipelineCache;
+    init_info.DescriptorPool = imGuiDescriptorPool;
+    init_info.RenderPass = renderPass;
+    init_info.Subpass = 0;
+    init_info.MinImageCount = 2;
+    init_info.ImageCount = 2;
+    init_info.MSAASamples = (VkSampleCountFlagBits)msaaSamples;
+    init_info.CheckVkResultFn = check_vk_result;
+
+    ImGui_ImplVulkan_Init(&init_info);
+    ImGui_ImplVulkan_CreateFontsTexture();
+    ImGui_ImplVulkan_DestroyFontsTexture();
+  }
+
   void initVulkan() {
     createInstance();
     setupDebugMessenger();
@@ -418,6 +465,7 @@ private:
     createVertexBuffer();
     createIndexBuffer();
     createUniformBuffers();
+    createImGuiDescriptorPool();
     createDescriptorPool();
     createComputeDescriptorPool();
     createDescriptorSets();
@@ -1102,6 +1150,28 @@ private:
     }
   }
 
+  void createImGuiDescriptorPool() {
+    vk::DescriptorPoolSize poolSizes[] = {
+        {vk::DescriptorType::eCombinedImageSampler,
+         IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE},
+    };
+
+    vk::DescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+    poolInfo.maxSets = 0;
+
+    for (vk::DescriptorPoolSize &poolSize : poolSizes)
+      poolInfo.maxSets += poolSize.descriptorCount;
+
+    poolInfo.poolSizeCount = (uint32_t)IM_ARRAYSIZE(poolSizes);
+    poolInfo.pPoolSizes = poolSizes;
+
+    if (device.createDescriptorPool(&poolInfo, nullptr, &imGuiDescriptorPool) !=
+        vk::Result::eSuccess) {
+      throw std::runtime_error("failed to create descriptor pool!");
+    }
+  }
+
   void createDescriptorPool() {
     std::array<vk::DescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = vk::DescriptorType::eUniformBuffer;
@@ -1424,9 +1494,21 @@ private:
 
     // drawParticles(commandBuffer);
 
+    renderImGui(commandBuffer);
+
     commandBuffer.endRenderPass();
 
     commandBuffer.end();
+  }
+
+  void renderImGui(vk::CommandBuffer commandBuffer) {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+    ImGui::ShowDemoWindow();
+
+    ImGui::Render();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
   }
 
   void drawParticles(vk::CommandBuffer commandBuffer) {
@@ -2305,6 +2387,7 @@ private:
   void mainLoop() {
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
+
       glfwSetScrollCallback(
           window, [](GLFWwindow *window, double xoffset, double yoffset) {
             TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
@@ -2315,6 +2398,7 @@ private:
         TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
         app->camera.key_callback(window, key, scancode, action, mods);
       });
+
       drawFrame();
     }
 
@@ -2449,6 +2533,10 @@ private:
   void cleanup() {
     cleanupSwapChain();
 
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
     device.destroySampler(textureSampler);
     device.destroyImageView(textureImageView);
 
@@ -2464,6 +2552,7 @@ private:
     }
 
     device.destroyDescriptorPool(descriptorPool);
+    device.destroyDescriptorPool(imGuiDescriptorPool);
     device.destroyDescriptorPool(computeDescriptorPool);
 
     device.destroyDescriptorSetLayout(descriptorSetLayout);

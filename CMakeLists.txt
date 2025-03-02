@@ -8,6 +8,7 @@ find_package(VulkanHeaders CONFIG)
 find_package(glm CONFIG REQUIRED)
 find_package(Stb REQUIRED)
 find_package(tinyobjloader CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 set(CMAKE_GENERATOR "MinGW Makefiles")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -28,4 +29,5 @@ target_link_libraries(Tengine PRIVATE
   Vulkan::Headers
   glm::glm
   tinyobjloader::tinyobjloader
+  imgui::imgui
 )
