@@ -19,7 +19,6 @@
 #include "imgui_impl_vulkan.h"
 
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -83,14 +82,28 @@ void DestroyDebugUtilsMessengerEXT(vk::Instance instance,
   instance.destroyDebugUtilsMessengerEXT(debugMessenger, pAllocator, dldi);
 }
 
+struct ModelPushConstants {
+  glm::vec4 data;
+  glm::mat4 model;
+};
+
+struct Texture {
+  vk::Image image;
+  vk::DeviceMemory imageMemory;
+  vk::ImageView imageView;
+  vk::Sampler sampler;
+  uint32_t mipLevels;
+};
+
 struct Vertex {
   glm::vec3 pos;
   glm::vec3 color;
   glm::vec2 texCoord;
+  uint32_t textureIndex;
 
   bool operator==(const Vertex &other) const {
     return pos == other.pos && color == other.color &&
-           texCoord == other.texCoord;
+           texCoord == other.texCoord && textureIndex == other.textureIndex;
   }
 
   static vk::VertexInputBindingDescription getBindingDescription() {
@@ -102,9 +115,9 @@ struct Vertex {
     return bindingDescription;
   }
 
-  static std::array<vk::VertexInputAttributeDescription, 3>
+  static std::array<vk::VertexInputAttributeDescription, 4>
   getAttributeDescriptions() {
-    std::array<vk::VertexInputAttributeDescription, 3> attributeDescriptions{};
+    std::array<vk::VertexInputAttributeDescription, 4> attributeDescriptions{};
 
     attributeDescriptions[0].binding = 0;
     attributeDescriptions[0].location = 0;
@@ -121,8 +134,24 @@ struct Vertex {
     attributeDescriptions[2].format = vk::Format::eR32G32Sfloat;
     attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
 
+    attributeDescriptions[3].binding = 0;
+    attributeDescriptions[3].location = 3;
+    attributeDescriptions[3].format = vk::Format::eR32Uint;
+    attributeDescriptions[3].offset = offsetof(Vertex, textureIndex);
+
     return attributeDescriptions;
   }
+};
+
+struct Model {
+  uint32_t verticesOffset;
+  uint32_t indicesOffset;
+  uint32_t textureIndex;
+  float angleX = 0.0f;
+  float angleY = 0.0f;
+  glm::vec3 position{0.0f, 0.0f, 0.0f};
+  std::vector<Vertex> vertices;
+  std::vector<uint32_t> indices;
 };
 
 struct Particle {
@@ -159,44 +188,10 @@ struct Particle {
 
 struct Camera {
   float fov = 45.0f;
-  float rotationX = 0.0f;
-  float rotationY = 0.0f;
-  bool autoRotate = false;
-  const float speed = 3.0f;
-  const float maxAngle = 359.0f;
-
-  void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
-    if (yoffset > 0) {
-      if (fov == 0.0f)
-        return;
-      fov -= 1.0f;
-    } else {
-      // TODO: add max FoV
-      fov += 1.0f;
-    }
-  }
-
-  void key_callback(GLFWwindow *window, int key, int scancode, int action,
-                    int mods) {
-    if (action != GLFW_REPEAT && action != GLFW_PRESS)
-      return;
-
-    switch (scancode) {
-    case 32:
-      if (rotationX < speed) {
-        float offset = rotationX - speed;
-        rotationX = maxAngle + offset;
-      } else {
-        rotationX -= speed;
-      }
-      break;
-    case 30:
-      rotationX = std::fmod(rotationX + speed, maxAngle);
-      break;
-    default:
-      return;
-    }
-  }
+  glm::vec3 eye = {2.0f, 2.0f, 2.0f};
+  glm::vec3 center = {0.0f, 0.0f, 0.0f};
+  glm::vec3 up = {0.0f, 0.0f, 1.0f};
+  glm::vec3 position = {0.0f, 0.0f, 0.0f};
 };
 
 namespace std {
@@ -211,7 +206,6 @@ template <> struct hash<Vertex> {
 } // namespace std
 
 struct UniformBufferObject {
-  alignas(16) glm::mat4 model;
   alignas(16) glm::mat4 view;
   alignas(16) glm::mat4 proj;
 };
@@ -286,11 +280,7 @@ private:
   vk::DescriptorPool descriptorPool;
   std::vector<vk::DescriptorSet> descriptorSets;
 
-  uint32_t mipLevels;
-  vk::Image textureImage;
-  vk::ImageView textureImageView;
-  vk::Sampler textureSampler;
-  vk::DeviceMemory textureImageMemory;
+  std::vector<Texture> textures;
 
   vk::Image depthImage;
   vk::DeviceMemory depthImageMemory;
@@ -315,6 +305,8 @@ private:
   vk::DescriptorPool computeDescriptorPool;
 
   Camera camera;
+
+  std::vector<Model> models;
 
   std::vector<const char *> getRequiredExtensions() {
     uint32_t glfwExtensionCount = 0;
@@ -458,10 +450,10 @@ private:
     createColorResources();
     createDepthResources();
     createFramebuffers();
-    createTextureImage();
-    createTextureImageView();
-    createTextureSampler();
-    loadModel();
+    createTextureImages();
+    createTextureImageViews();
+    createTextureSamplers();
+    loadModels();
     createVertexBuffer();
     createIndexBuffer();
     createUniformBuffers();
@@ -692,18 +684,49 @@ private:
     }
   }
 
-  void loadModel() {
+  void loadModels() {
+    loadModel("models/viking_room.obj");
+    loadModel("models/craneo.obj");
+
+    uint32_t prevVerticesOffset = 0;
+    uint32_t prevIndiciesOffset = 0;
+
+    uint32_t i = 0;
+
+    for (Model &model : models) {
+      model.textureIndex = i;
+
+      model.verticesOffset = prevVerticesOffset;
+      prevVerticesOffset += model.vertices.size() * sizeof(Vertex);
+
+      for (Vertex &vert : model.vertices) {
+        vert.textureIndex = i;
+      }
+
+      vertices.insert(vertices.end(), model.vertices.begin(),
+                      model.vertices.end());
+
+      model.indicesOffset = prevIndiciesOffset;
+      prevIndiciesOffset += model.indices.size();
+      indices.insert(indices.end(), model.indices.begin(), model.indices.end());
+
+      i += 1;
+    }
+  }
+
+  void loadModel(std::string path) {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
     std::vector<tinyobj::material_t> materials;
     std::string warn, err;
 
     if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
-                          MODEL_PATH.c_str())) {
+                          path.c_str())) {
       throw std::runtime_error(warn + err);
     }
 
     std::unordered_map<Vertex, uint32_t> uniqueVertices{};
+    Model model;
 
     for (const auto &shape : shapes) {
       for (const auto &index : shape.mesh.indices) {
@@ -717,13 +740,15 @@ private:
                       }};
 
         if (uniqueVertices.count(vertex) == 0) {
-          uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
-          vertices.push_back(vertex);
+          uniqueVertices[vertex] = static_cast<uint32_t>(model.vertices.size());
+          model.vertices.push_back(vertex);
         }
 
-        indices.push_back(uniqueVertices[vertex]);
+        model.indices.push_back(uniqueVertices[vertex]);
       }
     }
+
+    models.push_back(model);
   }
 
   void createDepthResources() {
@@ -768,7 +793,13 @@ private:
            format == vk::Format::eD24UnormS8Uint;
   }
 
-  void createTextureSampler() {
+  void createTextureSamplers() {
+    for (Texture &texture : textures) {
+      createTextureSampler(texture);
+    }
+  }
+
+  void createTextureSampler(Texture &texture) {
     auto properties = physicalDevice.getProperties();
     vk::SamplerCreateInfo samplerInfo{
         .sType = vk::StructureType::eSamplerCreateInfo,
@@ -784,21 +815,27 @@ private:
         .compareEnable = vk::False,
         .compareOp = vk::CompareOp::eAlways,
         .minLod = 0.0f,
-        .maxLod = static_cast<float>(mipLevels),
+        .maxLod = static_cast<float>(texture.mipLevels),
         .borderColor = vk::BorderColor::eIntOpaqueBlack,
         .unnormalizedCoordinates = vk::False,
     };
 
-    if (device.createSampler(&samplerInfo, nullptr, &textureSampler) !=
+    if (device.createSampler(&samplerInfo, nullptr, &texture.sampler) !=
         vk::Result::eSuccess) {
       throw std::runtime_error("failed to create texture sampler!");
     }
   }
 
-  void createTextureImageView() {
-    textureImageView =
-        createImageView(textureImage, vk::Format::eR8G8B8A8Srgb,
-                        vk::ImageAspectFlagBits::eColor, mipLevels);
+  void createTextureImageViews() {
+    for (Texture &texture : textures) {
+      createTextureImageView(texture);
+    }
+  }
+
+  void createTextureImageView(Texture &texture) {
+    texture.imageView =
+        createImageView(texture.image, vk::Format::eR8G8B8A8Srgb,
+                        vk::ImageAspectFlagBits::eColor, texture.mipLevels);
   }
 
   vk::ImageView createImageView(vk::Image image, vk::Format format,
@@ -824,19 +861,27 @@ private:
     return imageView;
   }
 
-  void createTextureImage() {
+  void createTextureImages() {
+    Texture tex1 = createTextureImage(TEXTURE_PATH);
+    Texture tex2 = createTextureImage("textures/difuso_flip_oscuro.jpg");
+    textures.push_back(tex1);
+    textures.push_back(tex2);
+  }
+
+  Texture createTextureImage(std::string path) {
     int texWidth, texHeight, texChannels;
-    stbi_uc *pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight,
+    stbi_uc *pixels = stbi_load(path.c_str(), &texWidth, &texHeight,
                                 &texChannels, STBI_rgb_alpha);
     vk::DeviceSize imageSize = texWidth * texHeight * 4;
+    Texture texture;
 
     if (!pixels) {
       throw std::runtime_error("failed to load texture image!");
     }
 
-    mipLevels = static_cast<uint32_t>(
-                    std::floor(std::log2(std::max(texWidth, texHeight)))) +
-                1;
+    uint32_t mipLevels = static_cast<uint32_t>(std::floor(
+                             std::log2(std::max(texWidth, texHeight)))) +
+                         1;
 
     vk::Buffer stagingBuffer;
     vk::DeviceMemory stagingBufferMemory;
@@ -853,26 +898,32 @@ private:
 
     stbi_image_free(pixels);
 
+    vk::Image image;
+    vk::DeviceMemory imageMemory;
     createImage(texWidth, texHeight, mipLevels, vk::SampleCountFlagBits::e1,
                 vk::Format::eR8G8B8A8Srgb, vk::ImageTiling::eOptimal,
                 vk::ImageUsageFlagBits::eTransferDst |
                     vk::ImageUsageFlagBits::eSampled |
                     vk::ImageUsageFlagBits::eTransferSrc,
-                vk::MemoryPropertyFlagBits::eDeviceLocal, textureImage,
-                textureImageMemory);
+                vk::MemoryPropertyFlagBits::eDeviceLocal, image, imageMemory);
 
-    transitionImageLayout(textureImage, vk::Format::eR8G8B8A8Srgb,
+    transitionImageLayout(image, vk::Format::eR8G8B8A8Srgb,
                           vk::ImageLayout::eUndefined,
                           vk::ImageLayout::eTransferDstOptimal, mipLevels);
-    copyBufferToImage(stagingBuffer, textureImage,
-                      static_cast<uint32_t>(texWidth),
+    copyBufferToImage(stagingBuffer, image, static_cast<uint32_t>(texWidth),
                       static_cast<uint32_t>(texHeight));
 
     device.destroyBuffer(stagingBuffer);
     device.freeMemory(stagingBufferMemory);
 
-    generateMipmap(textureImage, vk::Format::eR8G8B8A8Srgb, texWidth, texHeight,
+    generateMipmap(image, vk::Format::eR8G8B8A8Srgb, texWidth, texHeight,
                    mipLevels);
+
+    texture.mipLevels = mipLevels;
+    texture.image = image;
+    texture.imageMemory = imageMemory;
+
+    return texture;
   }
 
   void createColorResources() {
@@ -1115,10 +1166,15 @@ private:
       descriptorWrites[0].descriptorCount = 1;
       descriptorWrites[0].pBufferInfo = &bufferInfo;
 
-      vk::DescriptorImageInfo imageInfo{
-          .sampler = textureSampler,
-          .imageView = textureImageView,
-          .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+      std::vector<vk::DescriptorImageInfo> imageInfos;
+
+      for (Texture texture : textures) {
+        vk::DescriptorImageInfo imageInfo{
+            .sampler = texture.sampler,
+            .imageView = texture.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+        imageInfos.push_back(imageInfo);
+      }
 
       descriptorWrites[1].sType = vk::StructureType::eWriteDescriptorSet;
       descriptorWrites[1].dstSet = descriptorSets[i];
@@ -1126,27 +1182,12 @@ private:
       descriptorWrites[1].dstArrayElement = 0;
       descriptorWrites[1].descriptorType =
           vk::DescriptorType::eCombinedImageSampler;
-      descriptorWrites[1].descriptorCount = 1;
-      descriptorWrites[1].pImageInfo = &imageInfo;
+      descriptorWrites[1].descriptorCount = (uint32_t)imageInfos.size();
+      descriptorWrites[1].pImageInfo = imageInfos.data();
 
       device.updateDescriptorSets(
           static_cast<uint32_t>(descriptorWrites.size()),
           descriptorWrites.data(), 0, nullptr);
-
-      /*
-      vk::WriteDescriptorSet descriptorWrite{
-          .sType = vk::StructureType::eWriteDescriptorSet,
-          .dstSet = descriptorSets[i],
-          .dstBinding = 0,
-          .dstArrayElement = 0,
-          .descriptorCount = 1,
-          .descriptorType = vk::DescriptorType::eUniformBuffer,
-          .pImageInfo = nullptr,
-          .pBufferInfo = &bufferInfo,
-          .pTexelBufferView = nullptr};
-
-      device.updateDescriptorSets(1, &descriptorWrite, 0, nullptr);
-      */
     }
   }
 
@@ -1243,7 +1284,7 @@ private:
     vk::DescriptorSetLayoutBinding samplerLayoutBinding{
         .binding = 1,
         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-        .descriptorCount = 1,
+        .descriptorCount = 2, // TODO: CHANGE TO NUMBER OF TEXTURES
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .pImmutableSamplers = nullptr};
 
@@ -1323,7 +1364,7 @@ private:
   }
 
   void createVertexBuffer() {
-    vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+    vk::DeviceSize bufferSize = sizeof(Vertex) * vertices.size();
 
     vk::Buffer stagingBuffer;
     vk::DeviceMemory stagingBufferMemory;
@@ -1505,7 +1546,25 @@ private:
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-    ImGui::ShowDemoWindow();
+
+    ImGui::DragFloat("FoV", &camera.fov);
+    ImGui::DragFloat3("Eye", (float *)&camera.eye, 0.1f);
+    ImGui::DragFloat3("Center", (float *)&camera.center, 0.1f);
+    ImGui::DragFloat3("Up", (float *)&camera.up, 0.1f);
+
+    uint32_t i = 0;
+    for (Model &model : models) {
+      ImGui::DragFloat3(std::format("Model {} pos", i).c_str(),
+                        (float *)&model.position, 0.1f);
+      ImGui::PushItemWidth(ImGui::CalcItemWidth() / 2);
+      ImGui::DragFloat(std::format("##X{}", i).c_str(), &model.angleX, 1.0f,
+                       0.0f, 0.0f, "x:%.1f");
+      ImGui::SameLine();
+      ImGui::DragFloat(std::format("##Y{}", i).c_str(), &model.angleY, 1.0f,
+                       0.0f, 0.0f, "y:%.1f");
+      ImGui::PopItemWidth();
+      i++;
+    }
 
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
@@ -1531,29 +1590,45 @@ private:
   }
 
   void drawGeometry(vk::CommandBuffer commandBuffer) {
-    vk::Viewport viewport{.x = 0.0f,
-                          .y = 0.0f,
-                          .width = static_cast<float>(swapChainExtent.width),
-                          .height = static_cast<float>(swapChainExtent.height),
-                          .minDepth = 0.0f,
-                          .maxDepth = 1.0f};
-    commandBuffer.setViewport(0, 1, &viewport);
+    for (Model model : models) {
+      vk::Viewport viewport{.x = 0.0f,
+                            .y = 0.0f,
+                            .width = static_cast<float>(swapChainExtent.width),
+                            .height =
+                                static_cast<float>(swapChainExtent.height),
+                            .minDepth = 0.0f,
+                            .maxDepth = 1.0f};
+      commandBuffer.setViewport(0, 1, &viewport);
 
-    vk::Rect2D scissor{.offset = {0, 0}, .extent = swapChainExtent};
-    commandBuffer.setScissor(0, 1, &scissor);
+      vk::Rect2D scissor{.offset = {0, 0}, .extent = swapChainExtent};
+      commandBuffer.setScissor(0, 1, &scissor);
 
-    vk::DeviceSize graphicsOffsets[] = {0};
-    vk::Buffer vertexBuffers[] = {vertexBuffer};
-    commandBuffer.bindVertexBuffers(0, 1, vertexBuffers, graphicsOffsets);
+      vk::DeviceSize vertexOffsets[] = {model.verticesOffset};
+      vk::Buffer vertexBuffers[] = {vertexBuffer};
+      commandBuffer.bindVertexBuffers(0, 1, vertexBuffers, vertexOffsets);
 
-    commandBuffer.bindIndexBuffer(indexBuffer, 0, vk::IndexType::eUint32);
+      commandBuffer.bindIndexBuffer(indexBuffer, 0, vk::IndexType::eUint32);
 
-    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-                                     graphicsPipelineLayout, 0, 1,
-                                     &descriptorSets[currentFrame], 0, nullptr);
+      commandBuffer.bindDescriptorSets(
+          vk::PipelineBindPoint::eGraphics, graphicsPipelineLayout, 0, 1,
+          &descriptorSets[currentFrame], 0, nullptr);
 
-    commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0,
-                              0);
+      ModelPushConstants constants;
+      constants.model =
+          glm::rotate(glm::mat4(1.0f), glm::radians(model.angleX),
+                      glm::normalize(glm::vec3(1.0f, 0.0f, 0.0f)));
+      constants.model =
+          glm::rotate(constants.model, glm::radians(model.angleY),
+                      glm::normalize(glm::vec3(0.0f, 1.0f, 0.0f)));
+      constants.model = glm::translate(constants.model, model.position);
+
+      commandBuffer.pushConstants(graphicsPipelineLayout,
+                                  vk::ShaderStageFlagBits::eVertex, 0,
+                                  sizeof(ModelPushConstants), &constants);
+
+      commandBuffer.drawIndexed(static_cast<uint32_t>(model.indices.size()), 1,
+                                model.indicesOffset, 0, 0);
+    }
   }
 
   void createCommandPool() {
@@ -1946,10 +2021,17 @@ private:
         .attachmentCount = 1,
         .pAttachments = &colorBlendAttachment};
 
+    vk::PushConstantRange pushConstant{.stageFlags =
+                                           vk::ShaderStageFlagBits::eVertex,
+                                       .offset = 0,
+                                       .size = sizeof(ModelPushConstants)};
+
     vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
         .sType = vk::StructureType::ePipelineLayoutCreateInfo,
         .setLayoutCount = 1,
-        .pSetLayouts = &descriptorSetLayout};
+        .pSetLayouts = &descriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstant};
 
     if (device.createPipelineLayout(&pipelineLayoutInfo, nullptr,
                                     &graphicsPipelineLayout) !=
@@ -2387,18 +2469,6 @@ private:
   void mainLoop() {
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
-
-      glfwSetScrollCallback(
-          window, [](GLFWwindow *window, double xoffset, double yoffset) {
-            TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
-            app->camera.scroll_callback(window, xoffset, yoffset);
-          });
-      glfwSetKeyCallback(window, [](GLFWwindow *window, int key, int scancode,
-                                    int action, int mods) {
-        TengineApp *app = (TengineApp *)glfwGetWindowUserPointer(window);
-        app->camera.key_callback(window, key, scancode, action, mods);
-      });
-
       drawFrame();
     }
 
@@ -2502,28 +2572,11 @@ private:
 
   void updateUniformBuffer(uint32_t currentImage) {
     UniformBufferObject ubo{
-        .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f),
-                            glm::vec3(0.0f, 0.0f, 0.0f),
-                            glm::vec3(0.0f, 0.0f, 1.0f)),
-        .proj = glm::perspective(glm::radians(camera.fov),
-                                 swapChainExtent.width /
-                                     (float)swapChainExtent.height,
-                                 0.1f, 10.0f)};
-
-    if (camera.autoRotate) {
-      static auto startTime = std::chrono::high_resolution_clock::now();
-
-      auto currentTime = std::chrono::high_resolution_clock::now();
-      float time = std::chrono::duration<float, std::chrono::seconds::period>(
-                       currentTime - startTime)
-                       .count();
-
-      ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
-                              glm::vec3(0.0f, 0.0f, 1.0f));
-    } else {
-      ubo.model = glm::rotate(glm::mat4(1.0f), glm::radians(camera.rotationX),
-                              glm::vec3(0.0f, 0.0f, 1.0f));
-    }
+        .view = glm::lookAt(camera.eye, camera.center, camera.up),
+        .proj = glm::perspective(
+            glm::radians(camera.fov),
+            swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f),
+    };
 
     ubo.proj[1][1] *= -1;
 
@@ -2537,11 +2590,12 @@ private:
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
 
-    device.destroySampler(textureSampler);
-    device.destroyImageView(textureImageView);
-
-    device.destroyImage(textureImage);
-    device.freeMemory(textureImageMemory);
+    for (Texture texture : textures) {
+      device.destroySampler(texture.sampler);
+      device.destroyImageView(texture.imageView);
+      device.destroyImage(texture.image);
+      device.freeMemory(texture.imageMemory);
+    }
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
       device.destroyBuffer(uniformBuffers[i]);
