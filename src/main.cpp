@@ -61,9 +61,6 @@ const uint32_t HEIGHT = 720;
 
 const uint32_t PARTICLE_COUNT = 8192;
 
-const std::string MODEL_PATH = "models/viking_room.obj";
-const std::string TEXTURE_PATH = "textures/viking_room.png";
-
 const std::vector<const char *> validationLayers = {
     "VK_LAYER_KHRONOS_validation"};
 
@@ -103,7 +100,9 @@ struct Texture {
   vk::DeviceMemory imageMemory;
   vk::ImageView imageView;
   vk::Sampler sampler;
+  std::string path;
   uint32_t mipLevels;
+  uint32_t index;
 };
 
 struct Vertex {
@@ -155,12 +154,17 @@ struct Vertex {
 };
 
 struct Model {
+  std::string name;
+
   uint32_t verticesOffset;
-  uint32_t indicesOffset;
-  uint32_t textureIndex;
+  uint32_t firstIndex;
+
+  std::string texturePath;
+
   float angleX = 0.0f;
   float angleY = 0.0f;
   glm::vec3 position{0.0f, 0.0f, 0.0f};
+
   std::vector<Vertex> vertices;
   std::vector<uint32_t> indices;
 };
@@ -318,6 +322,8 @@ private:
   Camera camera;
 
   std::vector<Model> models;
+
+  std::map<std::string, uint32_t> texturesIndexMap;
 
   std::vector<const char *> getRequiredExtensions() {
     uint32_t glfwExtensionCount = 0;
@@ -679,36 +685,26 @@ private:
   }
 
   void loadModels() {
-    loadModel("models/viking_room.obj");
-    loadModel("models/craneo.obj");
+    loadModel("models/viking_room.obj", "textures/viking_room.png",
+              "viking_room");
+    loadModel("models/craneo.obj", "textures/difuso_flip_oscuro.jpg", "skull");
 
     uint32_t prevVerticesOffset = 0;
-    uint32_t prevIndiciesOffset = 0;
-
-    uint32_t i = 0;
+    uint32_t firstIndex = 0;
 
     for (Model &model : models) {
-      model.textureIndex = i;
-
       model.verticesOffset = prevVerticesOffset;
       prevVerticesOffset += model.vertices.size() * sizeof(Vertex);
-
-      for (Vertex &vert : model.vertices) {
-        vert.textureIndex = i;
-      }
-
       vertices.insert(vertices.end(), model.vertices.begin(),
                       model.vertices.end());
 
-      model.indicesOffset = prevIndiciesOffset;
-      prevIndiciesOffset += model.indices.size();
+      model.firstIndex = firstIndex;
+      firstIndex += model.indices.size();
       indices.insert(indices.end(), model.indices.begin(), model.indices.end());
-
-      i += 1;
     }
   }
 
-  void loadModel(std::string path) {
+  void loadModel(std::string path, std::string texturePath, std::string name) {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
     std::vector<tinyobj::material_t> materials;
@@ -720,18 +716,30 @@ private:
     }
 
     std::unordered_map<Vertex, uint32_t> uniqueVertices{};
-    Model model;
+
+    Model model{.name = name, .texturePath = texturePath};
+
+    uint32_t textureIndex = 0;
+
+    if (texturesIndexMap.find(texturePath) != texturesIndexMap.end()) {
+      textureIndex = texturesIndexMap[texturePath];
+    } else {
+      throw std::runtime_error("texture path not found");
+    }
 
     for (const auto &shape : shapes) {
       for (const auto &index : shape.mesh.indices) {
-        Vertex vertex{.pos = {attrib.vertices[3 * index.vertex_index + 0],
-                              attrib.vertices[3 * index.vertex_index + 1],
-                              attrib.vertices[3 * index.vertex_index + 2]},
-                      .color = {1.0f, 1.0f, 1.0f},
-                      .texCoord = {
-                          attrib.texcoords[2 * index.texcoord_index + 0],
-                          1.0f - attrib.texcoords[2 * index.texcoord_index + 1],
-                      }};
+        Vertex vertex{
+            .pos = {attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2]},
+            .color = {1.0f, 1.0f, 1.0f},
+            .texCoord =
+                {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1],
+                },
+            .textureIndex = textureIndex};
 
         if (uniqueVertices.count(vertex) == 0) {
           uniqueVertices[vertex] = static_cast<uint32_t>(model.vertices.size());
@@ -850,18 +858,20 @@ private:
   }
 
   void createTextureImages() {
-    Texture tex1 = createTextureImage(TEXTURE_PATH);
-    Texture tex2 = createTextureImage("textures/difuso_flip_oscuro.jpg");
-    textures.push_back(tex1);
-    textures.push_back(tex2);
+    createTextureImage("textures/viking_room.png");
+    createTextureImage("textures/difuso_flip_oscuro.jpg");
+
+    for (uint32_t i = 0; i < textures.size(); i++) {
+      std::string texturePath = textures[i].path;
+      texturesIndexMap[texturePath] = i;
+    }
   }
 
-  Texture createTextureImage(std::string path) {
+  void createTextureImage(std::string path) {
     int texWidth, texHeight, texChannels;
     stbi_uc *pixels = stbi_load(path.c_str(), &texWidth, &texHeight,
                                 &texChannels, STBI_rgb_alpha);
     vk::DeviceSize imageSize = texWidth * texHeight * 4;
-    Texture texture;
 
     if (!pixels) {
       throw std::runtime_error("failed to load texture image!");
@@ -907,11 +917,12 @@ private:
     generateMipmap(image, vk::Format::eR8G8B8A8Srgb, texWidth, texHeight,
                    mipLevels);
 
-    texture.mipLevels = mipLevels;
-    texture.image = image;
-    texture.imageMemory = imageMemory;
+    Texture texture{.image = image,
+                    .imageMemory = imageMemory,
+                    .path = path,
+                    .mipLevels = mipLevels};
 
-    return texture;
+    textures.push_back(texture);
   }
 
   void createColorResources() {
@@ -1147,11 +1158,12 @@ private:
 
       std::vector<vk::DescriptorImageInfo> imageInfos;
 
-      for (Texture texture : textures) {
+      for (size_t i = 0; i < textures.size(); i++) {
         vk::DescriptorImageInfo imageInfo{
-            .sampler = texture.sampler,
-            .imageView = texture.imageView,
+            .sampler = textures[i].sampler,
+            .imageView = textures[i].imageView,
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+
         imageInfos.push_back(imageInfo);
       }
 
@@ -1577,7 +1589,7 @@ private:
                                   sizeof(ModelPushConstants), &constants);
 
       commandBuffer.drawIndexed(static_cast<uint32_t>(model.indices.size()), 1,
-                                model.indicesOffset, 0, 0);
+                                model.firstIndex, 0, 0);
     }
   }
 
